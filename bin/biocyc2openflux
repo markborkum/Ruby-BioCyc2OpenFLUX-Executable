@@ -1,0 +1,456 @@
+#!/usr/bin/env ruby
+
+require "biocyc"
+require "openflux"
+require "thor"
+
+module OpenFLUX # :nodoc:
+  module BioCyc # :nodoc:
+    class Equation < OpenFLUX::Equation # :nodoc:
+      # Construct an instance using a BioCyc Reaction
+      #
+      # @param biocyc_reaction [BioCyc::Reaction]
+      # @return [OpenFLUX::BioCyc::Equation]
+      def self.for(biocyc_reaction)
+        reagent_names = biocyc_reaction.left.inject([]) { |acc, left|
+          left.coefficient.times { acc << left.value }
+          acc
+        }.collect(&:object_id)
+        
+        product_names = biocyc_reaction.right.inject([]) { |acc, right|
+          right.coefficient.times { acc << right.value }
+          acc
+        }.collect(&:object_id)
+        
+        new(reagent_names, product_names)
+      end
+    end
+
+    class CarbonAtomTransitionEquation < OpenFLUX::CarbonAtomTransitionEquation # :nodoc:
+      # Construct an instance usinga BioCyc Reaction
+      #
+      # @param biocyc_reaction [BioCyc::Reaction]
+      # @param exclude [Array<BioCyc::ObjectId>]
+      # @raise [OpenFLUX::CarbonAtomTransitionEquationAtomNotFound]
+      # @raise [OpenFLUX::CarbonAtomTransitionEquationDuplicateAtomAssignment]
+      # @raise [OpenFLUX::CarbonAtomTransitionEquationTooLarge]
+      # @raise [OpenFLUX::CarbonAtomTransitionEquationUnbalanced]
+      # @return [OpenFLUX::BioCyc::CarbonAtomTransitionEquation]
+      # @yieldparam carbon_atom_transition_equation [OpenFLUX::BioCyc::CarbonAtomTransitionEquation]
+      def self.for(biocyc_reaction, exclude = [], &block)
+        exclude = [
+          exclude,
+          biocyc_reaction.left.collect(&:value).select { |value|
+            if value.respond_to?(:cml) && !(cml = value.cml).nil? && !(cml_molecule = cml.molecule).nil?
+              cml_molecule.atoms.empty?
+            else
+              true
+            end
+          }.collect(&:object_id),
+          biocyc_reaction.right.collect(&:value).select { |value|
+            if value.respond_to?(:cml) && !(cml = value.cml).nil? && !(cml_molecule = cml.molecule).nil?
+              cml_molecule.atoms.empty?
+            else
+              true
+            end
+          }.collect(&:object_id),
+        ].flatten
+        
+        biocyc_reaction.atom_mappings.collect { |atom_mapping|
+          atom_mapping = atom_mapping.merge(atom_mapping.invert)
+          
+          assignments = {}
+          
+          reagent_names = biocyc_reaction.left.collect { |left|
+            Range.new(1, left.coefficient).collect { |index|
+              if exclude.include?(left.value.object_id)
+                OpenFLUX::CarbonAtomTransitionEquation::DUMMY_VALUE
+              else
+                carbon_atoms = left.value.cml.molecule.atoms.select { |biocyc_cml_atom|
+                  biocyc_cml_atom.element_type.eql?("C")
+                }.reject { |biocyc_cml_atom|
+                  key = "#{index}-#{biocyc_cml_atom.id}"
+                  
+                  should_exclude_biocyc_cml_atom?(key, exclude) || (atom_mapping.key?(key) && should_exclude_biocyc_cml_atom?(atom_mapping[key], exclude))
+                }
+                
+                if carbon_atoms.empty?
+                  OpenFLUX::CarbonAtomTransitionEquation::DUMMY_VALUE
+                else
+                  carbon_atoms.collect { |biocyc_cml_atom|
+                    raise OpenFLUX::CarbonAtomTransitionEquationTooLarge.new("Carbon atom transition equation is too large") if assignments.size >= OpenFLUX::CarbonAtomTransitionEquation::LABELS.size
+                    
+                    key = "#{index}-#{biocyc_cml_atom.id}"
+                    
+                    raise OpenFLUX::CarbonAtomTransitionEquationAtomNotFound.new("Reagent atom not found #{key.inspect}") unless atom_mapping.key?(key)
+                    
+                    raise OpenFLUX::CarbonAtomTransitionEquationDuplicateAtomAssignment.new("Duplicate atom assignment #{key.inspect}") if assignments.key?(atom_mapping[key])
+                    
+                    assignments[atom_mapping[key]] = OpenFLUX::CarbonAtomTransitionEquation::LABELS[assignments.size]
+                  }.join
+                end
+              end
+            }
+          }.flatten
+          
+          product_names = biocyc_reaction.right.collect { |right|
+            Range.new(1, right.coefficient).collect { |index|
+              if exclude.include?(right.value.object_id)
+                OpenFLUX::CarbonAtomTransitionEquation::DUMMY_VALUE
+              else
+                carbon_atoms = right.value.cml.molecule.atoms.select { |biocyc_cml_atom|
+                  biocyc_cml_atom.element_type.eql?("C")
+                }.reject { |biocyc_cml_atom|
+                  key = "#{index}-#{biocyc_cml_atom.id}"
+                  
+                  should_exclude_biocyc_cml_atom?(key, exclude) || (atom_mapping.key?(key) && should_exclude_biocyc_cml_atom?(atom_mapping[key], exclude))
+                }
+                
+                if carbon_atoms.empty?
+                  OpenFLUX::CarbonAtomTransitionEquation::DUMMY_VALUE
+                else
+                  carbon_atoms.collect { |biocyc_cml_atom|
+                    key = "#{index}-#{biocyc_cml_atom.id}"
+                    
+                    raise OpenFLUX::CarbonAtomTransitionEquationAtomNotFound.new("Product atom not found #{key.inspect}") unless assignments.key?(key)
+                    
+                    assignments.delete(key)
+                  }.join
+                end
+              end
+            }
+          }.flatten
+          
+          carbon_atom_transition_equation = new(reagent_names, product_names, &block)
+          
+          raise OpenFLUX::CarbonAtomTransitionEquationUnbalanced.new("Carbon atom transition equation is unbalanced #{carbon_atom_transition_equation.to_s.inspect}") if assignments.any?
+          
+          carbon_atom_transition_equation
+        }
+      end
+
+      private
+
+      # Decides if the OpenFLUX "rxnCTrans" should exclude the specified BioCyc CML Atom identifier
+      #
+      # @param biocyc_cml_atom_id [String]
+      # @param exclude [Array<BioCyc::ObjectId>]
+      # @raise [ArgumentError]
+      # @return [Boolean]
+      def self.should_exclude_biocyc_cml_atom?(biocyc_cml_atom_id, exclude = [])
+        if !(md = /\A(?:(0|[1-9][0-9]*)-)?(.+)-atom(0|[1-9][0-9]*)\Z/.match(biocyc_cml_atom_id)).nil?
+          exclude.any? { |object_id| md[2].eql?(object_id.frameid) }
+        else
+          raise ArgumentError.new("Unexpected value of '/ptools-xml/Compound/cml/molecule/atomArray/atom/@id/text()' #{biocyc_cml_atom_id.inspect}")
+        end
+      end
+    end
+
+    class Reaction < OpenFLUX::Reaction # :nodoc:
+      # Construct an instance using a BioCyc Reaction
+      #
+      # @param biocyc_reaction [BioCyc::Reaction]
+      # @param exclude [Array<BioCyc::ObjectId>]
+      # @raise [ArgumentError]
+      # @raise [OpenFLUX::CarbonAtomTransitionEquationAtomNotFound]
+      # @raise [OpenFLUX::CarbonAtomTransitionEquationDuplicateAtomAssignment]
+      # @raise [OpenFLUX::CarbonAtomTransitionEquationTooLarge]
+      # @raise [OpenFLUX::CarbonAtomTransitionEquationUnbalanced]
+      # @return [OpenFLUX::BioCyc::Reaction]
+      # @yieldparam reaction [OpenFLUX::BioCyc::Reaction]
+      def self.for(biocyc_reaction, exclude = [], &block)
+        equation = OpenFLUX::BioCyc::Equation.for(biocyc_reaction)
+        
+        carbon_atom_transition_equations = OpenFLUX::BioCyc::CarbonAtomTransitionEquation.for(biocyc_reaction, exclude)
+        
+        if carbon_atom_transition_equations.empty?
+          carbon_atom_transition_equations = [
+            OpenFLUX::BioCyc::CarbonAtomTransitionEquation.new([], []),
+          ]
+        end
+        
+        type = type_for(biocyc_reaction.reaction_direction)
+        
+        carbon_atom_transition_equations.collect { |carbon_atom_transition_equation|
+          new(equation, carbon_atom_transition_equation, type, &block)
+        }
+      end
+
+      private
+
+      # Map of BioCyc "reaction-direction" to OpenFLUX "rxnType"
+      #
+      # @return [Map{String=>String}]
+      TYPE_FOR_BIOCYC_REACTION_DIRECTION_VALUE = {
+        "REVERSIBLE" => "FR",
+        "PHYSIOL-LEFT-TO-RIGHT" => "F",
+        "PHYSIOL-RIGHT-TO-LEFT" => "F",
+        "IRREVERSIBLE-LEFT-TO-RIGHT" => "F",
+        "IRREVERSIBLE-RIGHT-TO-LEFT" => "F",
+        "LEFT-TO-RIGHT" => "F",
+        "RIGHT-TO-LEFT" => "F",
+      }.freeze
+
+      # Returns the OpenFLUX "rxnType" for the specified BioCyc "reaction-direction"
+      #
+      # @param biocyc_reaction_direction [BioCyc::Ext::ReactionDirection]
+      # @raise [ArgumentError]
+      # @return [String]
+      def self.type_for(biocyc_reaction_direction)
+        if TYPE_FOR_BIOCYC_REACTION_DIRECTION_VALUE.key?(biocyc_reaction_direction.value)
+          TYPE_FOR_BIOCYC_REACTION_DIRECTION_VALUE[biocyc_reaction_direction.value]
+        else
+          raise ArgumentError.new("Unexpected value of '/ptools-xml/Reaction/reaction-direction/text()' #{biocyc_reaction_direction.value.inspect}")
+        end
+      end
+    end
+
+    class MetaboliteBalanceModel < OpenFLUX::MetaboliteBalanceModel # :nodoc:
+      # Construct an instance using a BioCyc Pathway
+      #
+      # @param biocyc_pathway [BioCyc::Pathway]
+      # @param exclude [Array<BioCyc::ObjectId>]
+      # @raise [ArgumentError]
+      # @raise [OpenFLUX::CarbonAtomTransitionEquationAtomNotFound]
+      # @raise [OpenFLUX::CarbonAtomTransitionEquationDuplicateAtomAssignment]
+      # @raise [OpenFLUX::CarbonAtomTransitionEquationTooLarge]
+      # @raise [OpenFLUX::CarbonAtomTransitionEquationUnbalanced]
+      # @return [OpenFLUX::BioCyc::MetaboliteBalanceModel]
+      # @yieldparam metabolite_balance_model [OpenFLUX::BioCyc::MetaboliteBalanceModel]
+      def self.for(biocyc_pathway, exclude = [], &block)
+        new do |metabolite_balance_model|
+          biocyc_pathway.reaction_layout.each do |biocyc_reaction_layout|
+            if should_swap_reagents_and_products?(biocyc_reaction_layout.direction)
+              block_for_swap = Proc.new { |reaction|
+                reaction.equation = reaction.equation.swap
+                reaction.carbon_atom_transition_equation = reaction.carbon_atom_transition_equation.swap
+                reaction
+              }
+            else
+              block_for_swap = Proc.new { |reaction| reaction }
+            end
+            
+            case biocyc_reaction_layout.value
+            when ::BioCyc::Pathway
+              OpenFLUX::BioCyc::MetaboliteBalanceModel.for(biocyc_reaction_layout.value, exclude).reactions.each do |reaction|
+                metabolite_balance_model.reactions << reaction
+              end
+            when ::BioCyc::Reaction
+              OpenFLUX::BioCyc::Reaction.for(biocyc_reaction_layout.value, exclude, &block_for_swap).each do |reaction|
+                metabolite_balance_model.reactions << reaction
+              end
+            else
+              raise ArgumentError.new("Unexpected value of '/ptools-xml/Pathway/reaction-layout/*[1]' #{biocyc_reaction_layout.object.inspect}")
+            end
+          end
+          
+          if block_given?
+            case block.arity
+              when 1 then block.call(metabolite_balance_model)
+              else metabolite_balance_model.instance_eval(&block)
+            end
+          end
+        end
+      end
+
+      private
+
+      # Map of BioCyc "reaction-layout/direction" to whether or not the products and reagents should be swapped
+      #
+      # @return [Map{String=>Boolean}]
+      BIOCYC_REACTION_LAYOUT_DIRECTION_TO_SWAP_PRODUCTS_AND_REAGENTS = {
+        "L2R" => false,
+        "R2L" => true,
+      }.freeze
+
+      # Decides if the products and reagents of a reaction should be swapped
+      #
+      # @param biocyc_reaction_layout_direction [String]
+      # @raise [ArgumentError]
+      # @return [Boolean]
+      def self.should_swap_reagents_and_products?(biocyc_reaction_layout_direction)
+        if BIOCYC_REACTION_LAYOUT_DIRECTION_TO_SWAP_PRODUCTS_AND_REAGENTS.key?(biocyc_reaction_layout_direction)
+          BIOCYC_REACTION_LAYOUT_DIRECTION_TO_SWAP_PRODUCTS_AND_REAGENTS[biocyc_reaction_layout_direction]
+        else
+          raise ArgumentError.new("Unexpected value of '/ptools-xml/Pathway/reaction-layout/direction/text()' #{biocyc_reaction_layout_direction.inspect}")
+        end
+      end
+    end
+  end
+end
+
+class CLI < Thor
+  STANDARD_OUTPUT = "-".freeze
+
+  desc "pathway ORGID:OBJECT-ID", "BioCyc pathway to OpenFLUX metabolite balance model"
+  long_desc <<-LONGDESC
+The \033[1mpathway\033[0m utility converts the specified BioCyc pathway to an
+OpenFLUX metabolite balance model.
+
+\033[1mpathway\033[0m output is in comma-separated values (CSV) format.
+
+When generating a Carbon atom transition equation for a metabolite balance model,
+the \033[1mpathway\033[0m utility will ensure that every atom of every product
+and reagent compound is present, and that the resulting equation is balanced.
+An error will be reported if an equation is unbalanced, or if it contains too
+many Carbon atoms [1].
+
+When an output filename is specified, the \033[1mpathway\033[0m utility will
+ensure that the file does not exist, otherwise an error will be reported.
+
+\033[1mEXIT STATUS\033[0m
+
+The \033[1mpathway\033[0m utility exits with one of the following:
+\x5\t0\tConversion was successful.
+\x5\t1\tAn error occurred.
+
+\033[1mEXAMPLES\033[0m
+
+To convert the pathway `L-valine biosynthesis', excluding two cofactors, `NADP'
+and `reduced NADP', writing the result to `ECOLI_VALSYN-PWY.csv':
+
+$ biocyc2openflux pathway ECOLI:VALSYN-PWY --exclude ECOLI:NADP ECOLI:NADPH --outfile ECOLI_VALSYN-PWY.csv
+
+\033[1mBIBLIOGRAPHY\033[0m
+
+[1] Quek, Lake-Ee, et al. ``OpenFLUX: efficient modelling software for 13C-based metabolic flux analysis.'' Microbial cell factories 8.1 (2009): 25.
+LONGDESC
+  option :exclude, {
+    type: :array,
+    required: false,
+    default: [],
+    desc: "BioCyc object identifiers for excluded metabolites (e.g., cofactors)",
+  }
+  option :outfile, {
+    type: :string,
+    required: false,
+    default: STANDARD_OUTPUT,
+    desc: "Output filename, or #{STANDARD_OUTPUT.inspect} for standard output stream",
+  }
+  def pathway(id)
+    unless STANDARD_OUTPUT.eql?(options[:outfile])
+      if File.exist?(options[:outfile])
+        $stderr.puts("Output file already exists #{options[:outfile].inspect}")
+      
+        exit(1)
+      end
+    end
+    
+    object_id = BioCyc::ObjectId.for(id)
+    
+    exclude = options[:exclude].collect { |exclude_id|
+      BioCyc::ObjectId.for(exclude_id)
+    }
+    
+    object = object_id.to_object
+    
+    unless object.is_a?(BioCyc::Pathway)
+      $stderr.puts("Object is not a BioCyc Pathway #{object.object_id.to_s.inspect}")
+      
+      exit(1)
+    end
+    
+    metabolite_balance_model = OpenFLUX::BioCyc::MetaboliteBalanceModel.for(object, exclude)
+    
+    if STANDARD_OUTPUT.eql?(options[:outfile])
+      metabolite_balance_model.to_csv($stdout)
+    else
+      File.open(options[:outfile], "w") { |f|
+        metabolite_balance_model.to_csv(f)
+      }
+    end
+    
+    exit(0)
+  end
+
+  desc "reaction ORGID:OBJECT-ID ORGID:OBJECT-ID ...", "BioCyc reaction(s) to OpenFLUX metabolite balance model"
+  long_desc <<-LONGDESC
+The \033[1mreaction\033[0m utility converts the specified BioCyc reaction(s) to
+an OpenFLUX metabolite balance model.
+
+\033[1mreaction\033[0m output is in comma-separated values (CSV) format.
+
+When generating a Carbon atom transition equation for a metabolite balance model,
+the \033[1mreaction\033[0m utility will ensure that every atom of every product
+and reagent compound is present, and that the resulting equation is balanced.
+An error will be reported if an equation is unbalanced, or if it contains too
+many Carbon atoms [1].
+
+When an output filename is specified, the \033[1mreaction\033[0m utility will
+ensure that the file does not exist, otherwise an error will be reported.
+
+\033[1mEXIT STATUS\033[0m
+
+The \033[1mreaction\033[0m utility exits with one of the following:
+\x5\t0\tConversion was successful.
+\x5\t1\tAn error occurred.
+
+\033[1mEXAMPLES\033[0m
+
+To convert the reaction `citrate synthase', excluding two cofactors, `NADP'
+and `reduced NADP', writing the result to `ECOLI_CITSYN-RXN.csv':
+
+$ biocyc2openflux reaction ECOLI:CITSYN-RXN --exclude ECOLI:NADP ECOLI:NADPH --outfile ECOLI_CITSYN-RXN.csv
+
+\033[1mBIBLIOGRAPHY\033[0m
+
+[1] Quek, Lake-Ee, et al. ``OpenFLUX: efficient modelling software for 13C-based metabolic flux analysis.'' Microbial cell factories 8.1 (2009): 25.
+LONGDESC
+  option :exclude, {
+    type: :array,
+    required: false,
+    default: [],
+    desc: "BioCyc object identifiers for excluded metabolites (e.g., cofactors)",
+  }
+  option :outfile, {
+    type: :string,
+    required: false,
+    default: STANDARD_OUTPUT,
+    desc: "Output filename, or #{STANDARD_OUTPUT.inspect} for standard output stream",
+  }
+  def reaction(*ids)
+    unless STANDARD_OUTPUT.eql?(options[:outfile])
+      if File.exist?(options[:outfile])
+        $stderr.puts("Output file already exists #{options[:outfile].inspect}")
+      
+        exit(1)
+      end
+    end
+    
+    object_ids = ids.collect { |id|
+      BioCyc::ObjectId.for(id)
+    }
+    
+    exclude = options[:exclude].collect { |exclude_id|
+      BioCyc::ObjectId.for(exclude_id)
+    }
+    
+    objects = object_ids.collect(&:to_object)
+    
+    objects.each do |object|
+      unless object.is_a?(BioCyc::Reaction)
+        $stderr.puts("Object is not a BioCyc Reaction #{object.object_id.to_s.inspect}")
+        
+        exit(1)
+      end
+    end
+    
+    reactions = objects.collect { |object|
+      OpenFLUX::BioCyc::Reaction.for(object, exclude)
+    }.flatten
+    
+    metabolite_balance_model = OpenFLUX::BioCyc::MetaboliteBalanceModel.new(reactions)
+    
+    if STANDARD_OUTPUT.eql?(options[:outfile])
+      metabolite_balance_model.to_csv($stdout)
+    else
+      File.open(options[:outfile], "w") { |f|
+        metabolite_balance_model.to_csv(f)
+      }
+    end
+    
+    exit(0)
+  end
+end
+
+CLI.start(ARGV)
